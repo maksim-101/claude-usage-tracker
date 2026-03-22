@@ -1,39 +1,28 @@
 #!/usr/bin/env python3
 """
 Claude Code Usage Tracker — SwiftBar plugin
-Parses local JSONL logs from ~/.claude/projects/ to display token usage.
+Parses local JSONL logs from ~/.claude/projects/ to display token usage,
+cache efficiency, project activity, and git status.
 100% offline — no network calls, no data leaves your machine.
 
 NOTE: Only tracks Claude Code usage. Web (claude.ai) usage is not captured
-but counts toward the same limits. Percentages may undercount if you also
-use the web interface.
+but counts toward the same limits.
 """
 
 import json
 import os
 import glob
+import subprocess
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
-CONFIG_PATH = os.path.expanduser("~/.claude/usage-tracker-config.json")
-WINDOW_5H = timedelta(hours=5)
-WINDOW_7D = timedelta(days=7)
+PROJECTS_DIR = os.path.expanduser("~/Documents/claude_projects")
 
-# Calibrated defaults (output tokens) — derived from actual usage screenshots.
-# Adjust in ~/.claude/usage-tracker-config.json as you learn your exact limits.
-# These are for Max 5x ($100/mo). March 2026 promo may temporarily double them.
-DEFAULT_CONFIG = {
-    "limits": {
-        "5h": {
-            "total": 2_000_000,
-        },
-        "7d": {
-            "all_models": 13_000_000,
-            "sonnet": 7_000_000,
-        },
-    }
-}
+# SwiftBar runs with a minimal PATH — ensure common tool locations are included
+for p in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]:
+    if p not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = p + ":" + os.environ.get("PATH", "")
 
 MODEL_NAMES = {
     "opus": "Opus",
@@ -41,29 +30,16 @@ MODEL_NAMES = {
     "haiku": "Haiku",
 }
 
-BAR_WIDTH = 20
-FILL_CHAR = "█"
-EMPTY_CHAR = "░"
+# Display name overrides for projects whose encoded dir names lose characters
+DISPLAY_NAMES = {
+    "Selbstst-ndigkeit": "Selbstständigkeit",
+    "Digital-Solutions-Platform": "Digital Solutions Platform",
+}
+
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH) as f:
-                user_cfg = json.load(f)
-            cfg = DEFAULT_CONFIG.copy()
-            cfg["limits"] = DEFAULT_CONFIG["limits"].copy()
-            if "limits" in user_cfg:
-                for window in ("5h", "7d"):
-                    if window in user_cfg["limits"]:
-                        cfg["limits"][window] = {
-                            **DEFAULT_CONFIG["limits"].get(window, {}),
-                            **user_cfg["limits"][window],
-                        }
-            return cfg
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return DEFAULT_CONFIG
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def classify_model(model_id):
@@ -88,44 +64,96 @@ def fmt_tokens(n):
     return str(n)
 
 
-def progress_bar(current, limit, width=BAR_WIDTH):
-    if limit <= 0:
-        return FILL_CHAR * width, 100
-    pct = min(current / limit, 1.0)
-    filled = int(pct * width)
-    bar = FILL_CHAR * filled + EMPTY_CHAR * (width - filled)
-    return bar, pct * 100
+def sparkline(values):
+    """Return a sparkline string for a list of numeric values."""
+    if not values or max(values) == 0:
+        return SPARK_CHARS[0] * len(values)
+    peak = max(values)
+    return "".join(
+        SPARK_CHARS[min(int(v / peak * (len(SPARK_CHARS) - 1)), len(SPARK_CHARS) - 1)]
+        for v in values
+    )
 
 
-def bar_color(pct):
-    if pct >= 90:
-        return "#EF4444"
-    if pct >= 70:
-        return "#F59E0B"
-    if pct >= 50:
-        return "#FBBF24"
-    return "#10B981"
+def extract_project_name(filepath):
+    """Extract a friendly project name from a JSONL file path."""
+    rel = os.path.relpath(filepath, CLAUDE_DIR)
+    project_dir = rel.split(os.sep)[0]
+
+    if project_dir == "-Users-mowehr--claude":
+        return ".claude"
+
+    prefixes = [
+        "-Users-mowehr-Documents-claude_projects-",
+        "-Users-mowehr-Documents-claude-projects-",
+        "-Users-mowehr-",
+    ]
+    for prefix in prefixes:
+        if project_dir.startswith(prefix):
+            name = project_dir[len(prefix):] or project_dir
+            return DISPLAY_NAMES.get(name, name)
+
+    name = project_dir.lstrip("-") or project_dir
+    return DISPLAY_NAMES.get(name, name)
+
+
+def day_label(dt):
+    """Short weekday label for a date."""
+    return dt.strftime("%a")
+
+
+# ── Log Parsing ──────────────────────────────────────────────────────────────
 
 
 def parse_logs():
-    now = datetime.now(timezone.utc)
-    cutoff_5h = now - WINDOW_5H
-    cutoff_7d = now - WINDOW_7D
+    """Parse JSONL logs and return structured usage data.
 
-    usage_5h = defaultdict(lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
-    usage_7d = defaultdict(lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
-    msg_count_5h = 0
-    msg_count_7d = 0
+    Returns dict with:
+      - today: by_model, by_project, cache, messages
+      - week: by_model, by_project, cache, messages
+      - daily: {date_str: output_tokens} for sparkline
+      - project_last_active: {project: datetime}
+    """
+    now = datetime.now(timezone.utc)
+    local_now = datetime.now().astimezone()
+    today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Monday of this week (ISO weekday: Mon=1)
+    week_start = (local_now - timedelta(days=local_now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    # We need 7 days back for the sparkline
+    cutoff = week_start
+
+    def new_bucket():
+        return {
+            "by_model": defaultdict(lambda: {"input": 0, "output": 0}),
+            "by_project": defaultdict(lambda: {"input": 0, "output": 0}),
+            "cache": {"read": 0, "create": 0, "fresh_input": 0},
+            "messages": 0,
+        }
+
+    today_data = new_bucket()
+    week_data = new_bucket()
+
+    # Daily output tokens for sparkline (Mon-Sun of current week)
+    daily_output = defaultdict(int)
+
+    # Track last activity per project
+    project_last_active = {}
 
     jsonl_files = glob.glob(os.path.join(CLAUDE_DIR, "**", "*.jsonl"), recursive=True)
 
     for filepath in jsonl_files:
         try:
             mtime = os.path.getmtime(filepath)
-            if datetime.fromtimestamp(mtime, tz=timezone.utc) < cutoff_7d:
+            if datetime.fromtimestamp(mtime, tz=timezone.utc) < cutoff.astimezone(timezone.utc):
                 continue
         except OSError:
             continue
+
+        project = extract_project_name(filepath)
 
         try:
             with open(filepath, "r") as f:
@@ -155,152 +183,305 @@ def parse_logs():
                     except (ValueError, AttributeError):
                         continue
 
-                    if ts < cutoff_7d:
+                    ts_local = ts.astimezone(local_now.tzinfo)
+                    if ts_local < cutoff:
                         continue
+
+                    # Track last active
+                    if project not in project_last_active or ts_local > project_last_active[project]:
+                        project_last_active[project] = ts_local
 
                     model = classify_model(msg.get("model", ""))
                     input_tokens = usage.get("input_tokens", 0)
                     output_tokens = usage.get("output_tokens", 0)
                     cache_read = usage.get("cache_read_input_tokens", 0)
                     cache_create = usage.get("cache_creation_input_tokens", 0)
+                    # input_tokens is already the fresh (non-cached) input count
+                    fresh_input = input_tokens
 
-                    usage_7d[model]["input"] += input_tokens
-                    usage_7d[model]["output"] += output_tokens
-                    usage_7d[model]["cache_read"] += cache_read
-                    usage_7d[model]["cache_create"] += cache_create
-                    msg_count_7d += 1
+                    # Daily sparkline bucket
+                    day_key = ts_local.strftime("%Y-%m-%d")
+                    daily_output[day_key] += output_tokens
 
-                    if ts >= cutoff_5h:
-                        usage_5h[model]["input"] += input_tokens
-                        usage_5h[model]["output"] += output_tokens
-                        usage_5h[model]["cache_read"] += cache_read
-                        usage_5h[model]["cache_create"] += cache_create
-                        msg_count_5h += 1
+                    # Week bucket
+                    if ts_local >= week_start:
+                        w = week_data
+                        w["by_model"][model]["input"] += input_tokens
+                        w["by_model"][model]["output"] += output_tokens
+                        w["by_project"][project]["input"] += input_tokens
+                        w["by_project"][project]["output"] += output_tokens
+                        w["cache"]["read"] += cache_read
+                        w["cache"]["create"] += cache_create
+                        w["cache"]["fresh_input"] += fresh_input
+                        w["messages"] += 1
+
+                    # Today bucket
+                    if ts_local >= today_start:
+                        d = today_data
+                        d["by_model"][model]["input"] += input_tokens
+                        d["by_model"][model]["output"] += output_tokens
+                        d["by_project"][project]["input"] += input_tokens
+                        d["by_project"][project]["output"] += output_tokens
+                        d["cache"]["read"] += cache_read
+                        d["cache"]["create"] += cache_create
+                        d["cache"]["fresh_input"] += fresh_input
+                        d["messages"] += 1
 
         except (OSError, PermissionError):
             continue
 
+    # Build ordered daily values (Mon through today)
+    days_so_far = (local_now - week_start).days + 1
+    daily_values = []
+    daily_labels = []
+    for i in range(days_so_far):
+        day = week_start + timedelta(days=i)
+        key = day.strftime("%Y-%m-%d")
+        daily_values.append(daily_output.get(key, 0))
+        daily_labels.append(day.strftime("%a"))
+
     return {
-        "5h": usage_5h,
-        "7d": usage_7d,
-        "messages_5h": msg_count_5h,
-        "messages_7d": msg_count_7d,
+        "today": today_data,
+        "week": week_data,
+        "daily_values": daily_values,
+        "daily_labels": daily_labels,
+        "project_last_active": project_last_active,
     }
 
 
-def total_output(usage_dict):
-    return sum(v["output"] for v in usage_dict.values())
+def total_output(by_model):
+    return sum(v["output"] for v in by_model.values())
 
 
-def model_output(usage_dict, model):
-    return usage_dict.get(model, {}).get("output", 0)
+def total_input(by_model):
+    return sum(v["input"] for v in by_model.values())
 
 
-def total_input(usage_dict):
-    return sum(v["input"] for v in usage_dict.values())
+def cache_hit_ratio(cache):
+    """Return cache hit ratio as a percentage."""
+    total = cache["read"] + cache["fresh_input"]
+    if total == 0:
+        return 0
+    return cache["read"] / total * 100
+
+
+def cache_color(ratio):
+    """Color code for cache hit ratio — higher is better (inverse of bar_color)."""
+    if ratio >= 90:
+        return "#10B981"  # green — excellent
+    if ratio >= 70:
+        return "#FBBF24"  # yellow — decent
+    if ratio >= 50:
+        return "#F59E0B"  # orange — mediocre
+    return "#EF4444"      # red — poor
+
+
+# ── Git Integration ──────────────────────────────────────────────────────────
+
+
+def git_status_all():
+    """Check git status for all repos in PROJECTS_DIR.
+
+    Returns list of (project_name, dirty_count, unpushed_count).
+    Only includes repos with uncommitted changes or unpushed commits.
+    """
+    results = []
+    try:
+        entries = sorted(os.listdir(PROJECTS_DIR))
+    except (PermissionError, OSError):
+        return results
+
+    for name in entries:
+        repo = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(os.path.join(repo, ".git")):
+            continue
+        try:
+            # Count dirty files (modified + untracked)
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo, capture_output=True, text=True, timeout=5
+            )
+            dirty = len([l for l in status.stdout.strip().split("\n") if l.strip()]) if status.stdout.strip() else 0
+
+            # Count unpushed commits
+            unpushed = 0
+            tracking = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+                cwd=repo, capture_output=True, text=True, timeout=5
+            )
+            if tracking.returncode == 0:
+                ahead = subprocess.run(
+                    ["git", "rev-list", "--count", "@{u}..HEAD"],
+                    cwd=repo, capture_output=True, text=True, timeout=5
+                )
+                if ahead.returncode == 0:
+                    unpushed = int(ahead.stdout.strip())
+
+            if dirty > 0 or unpushed > 0:
+                results.append((name, dirty, unpushed))
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            continue
+
+    return results
+
+
+def open_prs():
+    """Get open PRs across all repos via gh CLI.
+
+    Returns list of (repo_name, pr_count) or None on failure.
+    """
+    results = []
+    try:
+        entries = sorted(os.listdir(PROJECTS_DIR))
+    except (PermissionError, OSError):
+        return None
+
+    for name in entries:
+        repo = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(os.path.join(repo, ".git")):
+            continue
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "list", "--state", "open", "--json", "number,title"],
+                cwd=repo, capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                prs = json.loads(result.stdout)
+                if prs:
+                    results.append((name, prs))
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            continue
+
+    return results
+
+
+# ── Render ───────────────────────────────────────────────────────────────────
+
+
+def render_section(label, color, data):
+    """Render a Today or This Week section."""
+    out = total_output(data["by_model"])
+    inp = total_input(data["by_model"])
+    print(f"{label} | size=14 color={color}")
+    print(f"--{fmt_tokens(out)} output, {fmt_tokens(inp)} input | font=Menlo size=12")
+    print(f"--{data['messages']} messages | font=Menlo size=12")
+
+    if data["by_model"]:
+        print("-----")
+        print("--By Model | size=12")
+        for model_key in ("opus", "sonnet", "haiku"):
+            m = data["by_model"].get(model_key)
+            if m and (m["output"] > 0 or m["input"] > 0):
+                print(f"----{friendly_model(model_key)}: {fmt_tokens(m['output'])} out, {fmt_tokens(m['input'])} in | font=Menlo size=11")
+        print("--By Project | size=12")
+        for proj, tokens in sorted(data["by_project"].items(), key=lambda x: x[1]["output"], reverse=True):
+            if tokens["output"] > 0:
+                print(f"----{proj}: {fmt_tokens(tokens['output'])} out, {fmt_tokens(tokens['input'])} in | font=Menlo size=11")
 
 
 def render():
-    config = load_config()
     data = parse_logs()
-    limits_5h = config["limits"]["5h"]
-    limits_7d = config["limits"]["7d"]
 
-    # Calculate percentages
-    total_out_5h = total_output(data["5h"])
-    total_out_7d = total_output(data["7d"])
-    sonnet_out_7d = model_output(data["7d"], "sonnet")
+    out_today = total_output(data["today"]["by_model"])
+    out_week = total_output(data["week"]["by_model"])
 
-    limit_5h = limits_5h.get("total", 1)
-    limit_7d_all = limits_7d.get("all_models", 1)
-    limit_7d_sonnet = limits_7d.get("sonnet", 1)
-
-    pct_5h = min(total_out_5h / limit_5h * 100, 100) if limit_5h > 0 else 0
-    pct_7d_all = min(total_out_7d / limit_7d_all * 100, 100) if limit_7d_all > 0 else 0
-    pct_7d_sonnet = min(sonnet_out_7d / limit_7d_sonnet * 100, 100) if limit_7d_sonnet > 0 else 0
-
-    # Menu bar title — show highest percentage (most constrained)
-    max_pct = max(pct_5h, pct_7d_all, pct_7d_sonnet)
-    tc = bar_color(max_pct)
-
-    if total_out_5h == 0 and total_out_7d == 0:
+    # ── Menu Bar ──
+    if out_today == 0 and out_week == 0:
         print("C: idle | sfimage=brain.head.profile")
     else:
-        mini_bar, _ = progress_bar(max_pct, 100, width=8)
-        print(f"C: {mini_bar} {max_pct:.0f}% | sfimage=brain.head.profile color={tc}")
+        print(f"C: {fmt_tokens(out_today)} | sfimage=brain.head.profile")
 
     print("---")
 
-    # === Current Session (5-hour window) ===
-    bar_5h, _ = progress_bar(total_out_5h, limit_5h)
-    bc_5h = bar_color(pct_5h)
-    print(f"Current Session — {pct_5h:.0f}% | size=14 color=#7C3AED")
-    print(f"--{bar_5h} {pct_5h:.0f}% | font=Menlo size=12 color={bc_5h}")
-    print(f"--{fmt_tokens(total_out_5h)} / {fmt_tokens(limit_5h)} output tokens | font=Menlo size=12")
-    print(f"--Messages: {data['messages_5h']} | font=Menlo size=12")
-    print("-----")
-    # Per-model breakdown (info only, not separate limits)
-    print("--By Model | size=12")
-    for model_key in ("opus", "sonnet", "haiku"):
-        out = model_output(data["5h"], model_key)
-        inp = data["5h"].get(model_key, {}).get("input", 0)
-        if out > 0 or inp > 0:
-            name = friendly_model(model_key)
-            share = (out / total_out_5h * 100) if total_out_5h > 0 else 0
-            print(f"----{name}: {fmt_tokens(out)} out, {fmt_tokens(inp)} in ({share:.0f}%) | font=Menlo size=11")
+    # ── Today ──
+    render_section("Today", "#7C3AED", data["today"])
 
     print("---")
 
-    # === Weekly Limits ===
-    print(f"Weekly Limits | size=14 color=#2563EB")
+    # ── This Week ──
+    render_section("This Week", "#2563EB", data["week"])
 
-    # All models
-    bar_7d, _ = progress_bar(total_out_7d, limit_7d_all)
-    bc_7d = bar_color(pct_7d_all)
-    print(f"--All Models — {pct_7d_all:.0f}% | size=13")
-    print(f"----{bar_7d} {pct_7d_all:.0f}% | font=Menlo size=12 color={bc_7d}")
-    print(f"----{fmt_tokens(total_out_7d)} / {fmt_tokens(limit_7d_all)} output tokens | font=Menlo size=12")
-    print(f"----Messages: {data['messages_7d']} | font=Menlo size=12")
-
-    # Sonnet only
-    bar_sonnet, _ = progress_bar(sonnet_out_7d, limit_7d_sonnet)
-    bc_sonnet = bar_color(pct_7d_sonnet)
-    print(f"--Sonnet Only — {pct_7d_sonnet:.0f}% | size=13")
-    print(f"----{bar_sonnet} {pct_7d_sonnet:.0f}% | font=Menlo size=12 color={bc_sonnet}")
-    print(f"----{fmt_tokens(sonnet_out_7d)} / {fmt_tokens(limit_7d_sonnet)} output tokens | font=Menlo size=12")
-
-    print("-----")
-    # Per-model breakdown (info only)
-    print("--By Model | size=12")
-    for model_key in ("opus", "sonnet", "haiku"):
-        out = model_output(data["7d"], model_key)
-        inp = data["7d"].get(model_key, {}).get("input", 0)
-        if out > 0 or inp > 0:
-            name = friendly_model(model_key)
-            share = (out / total_out_7d * 100) if total_out_7d > 0 else 0
-            print(f"----{name}: {fmt_tokens(out)} out, {fmt_tokens(inp)} in ({share:.0f}%) | font=Menlo size=11")
+    # Weekly sparkline chart — one line per day for alignment
+    if data["daily_values"]:
+        print("-----")
+        print("--Daily Output | size=12")
+        peak = max(data["daily_values"]) if data["daily_values"] else 0
+        for label, value in zip(data["daily_labels"], data["daily_values"]):
+            bar_char = SPARK_CHARS[min(int(value / peak * (len(SPARK_CHARS) - 1)), len(SPARK_CHARS) - 1)] if peak > 0 else SPARK_CHARS[0]
+            bar = bar_char * 8
+            print(f"----{label}  {bar}  {fmt_tokens(value):>6} | font=Menlo size=11")
 
     print("---")
 
-    # Cache summary
-    cache_r_5h = sum(v["cache_read"] for v in data["5h"].values())
-    cache_c_5h = sum(v["cache_create"] for v in data["5h"].values())
-    print(f"Cache (5h): {fmt_tokens(cache_r_5h)} read, {fmt_tokens(cache_c_5h)} write | size=11 color=gray")
+    # ── Cache Efficiency ──
+    today_ratio = cache_hit_ratio(data["today"]["cache"])
+    week_ratio = cache_hit_ratio(data["week"]["cache"])
+    tc = data["today"]["cache"]
+    wc = data["week"]["cache"]
+
+    tc_color = cache_color(today_ratio)
+    wc_color = cache_color(week_ratio)
+    print(f"Cache Efficiency | size=14 color=#0891B2")
+    print(f"--Today: {today_ratio:.1f}% hit ratio | font=Menlo size=12 color={tc_color}")
+    print(f"----{fmt_tokens(tc['read'])} read, {fmt_tokens(tc['create'])} created, {fmt_tokens(tc['fresh_input'])} fresh | font=Menlo size=11")
+    print(f"--Week:  {week_ratio:.1f}% hit ratio | font=Menlo size=12 color={wc_color}")
+    print(f"----{fmt_tokens(wc['read'])} read, {fmt_tokens(wc['create'])} created, {fmt_tokens(wc['fresh_input'])} fresh | font=Menlo size=11")
 
     print("---")
 
-    # Caveat
+    # ── Projects ──
+    print(f"Projects | size=14 color=#059669")
+    active = data["project_last_active"]
+    if active:
+        now = datetime.now().astimezone()
+        for proj, last in sorted(active.items(), key=lambda x: x[1], reverse=True):
+            ago = now - last
+            if ago.total_seconds() < 60:
+                ago_str = "just now"
+            elif ago.total_seconds() < 3600:
+                ago_str = f"{int(ago.total_seconds() / 60)}m ago"
+            elif ago.total_seconds() < 86400:
+                ago_str = f"{int(ago.total_seconds() / 3600)}h ago"
+            else:
+                ago_str = f"{int(ago.days)}d ago"
+
+            out = data["week"]["by_project"].get(proj, {}).get("output", 0)
+            print(f"--{proj} — {ago_str} ({fmt_tokens(out)} this week) | font=Menlo size=11")
+    else:
+        print("--No activity this week | size=11 color=gray")
+
+    print("---")
+
+    # ── Git Status ──
+    print(f"Git | size=14 color=#DC2626")
+    repos = git_status_all()
+    if repos:
+        for name, dirty, unpushed in repos:
+            parts = []
+            if dirty:
+                parts.append(f"{dirty} dirty")
+            if unpushed:
+                parts.append(f"{unpushed} unpushed")
+            print(f"--{name}: {', '.join(parts)} | font=Menlo size=11")
+    else:
+        print("--All clean | font=Menlo size=11 color=#10B981")
+
+    # Open PRs (non-blocking — skip if gh is slow)
+    pr_data = open_prs()
+    if pr_data is not None:
+        if pr_data:
+            total_prs = sum(len(prs) for _, prs in pr_data)
+            print(f"--{total_prs} open PR{'s' if total_prs != 1 else ''} | font=Menlo size=11 color=#F59E0B")
+            for repo_name, prs in pr_data:
+                for pr in prs:
+                    print(f"----{repo_name}: #{pr['number']} {pr.get('title', '')} | font=Menlo size=10")
+        else:
+            print(f"--No open PRs | font=Menlo size=11 color=gray")
+
+    print("---")
+
+    # ── Footer ──
     print("Claude Code only — web usage not tracked | size=10 color=#F59E0B")
-
-    print("---")
-
-    # Config
-    print(f"Settings | size=12")
-    print(f"--Config: {CONFIG_PATH} | size=10 color=gray")
-    print(f"--Edit config | size=11 bash=open param1={CONFIG_PATH} terminal=false")
-    if not os.path.exists(CONFIG_PATH):
-        print(f"--Create default config | size=11 bash=python3 param1=-c param2=import\\ json;open('{CONFIG_PATH}','w').write(json.dumps({json.dumps(DEFAULT_CONFIG)},indent=2)) terminal=false refresh=true")
-
     print("---")
     print("Refresh | refresh=true")
     now_str = datetime.now().strftime("%H:%M")
