@@ -26,11 +26,11 @@ WINDOW_7D = timedelta(days=7)
 DEFAULT_CONFIG = {
     "limits": {
         "5h": {
-            "total": 1_850_000,
+            "total": 2_000_000,
         },
         "7d": {
-            "all_models": 12_300_000,
-            "sonnet": 6_500_000,
+            "all_models": 13_000_000,
+            "sonnet": 7_000_000,
         },
     }
 }
