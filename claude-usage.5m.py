@@ -3,6 +3,10 @@
 Claude Code Usage Tracker — SwiftBar plugin
 Parses local JSONL logs from ~/.claude/projects/ to display token usage.
 100% offline — no network calls, no data leaves your machine.
+
+NOTE: Only tracks Claude Code usage. Web (claude.ai) usage is not captured
+but counts toward the same limits. Percentages may undercount if you also
+use the web interface.
 """
 
 import json
@@ -16,21 +20,17 @@ CONFIG_PATH = os.path.expanduser("~/.claude/usage-tracker-config.json")
 WINDOW_5H = timedelta(hours=5)
 WINDOW_7D = timedelta(days=7)
 
-# Default limits (output tokens) — based on Max 5x community estimates.
-# Adjust in ~/.claude/usage-tracker-config.json once you learn your actual limits.
+# Calibrated defaults (output tokens) — derived from actual usage screenshots.
+# Adjust in ~/.claude/usage-tracker-config.json as you learn your exact limits.
+# These are for Max 5x ($100/mo). March 2026 promo may temporarily double them.
 DEFAULT_CONFIG = {
     "limits": {
         "5h": {
-            "opus": 800_000,
-            "sonnet": 2_000_000,
-            "haiku": 5_000_000,
-            "total": 3_000_000,
+            "total": 1_850_000,
         },
         "7d": {
-            "opus": 5_000_000,
-            "sonnet": 15_000_000,
-            "haiku": 50_000_000,
-            "total": 20_000_000,
+            "all_models": 12_300_000,
+            "sonnet": 6_500_000,
         },
     }
 }
@@ -41,7 +41,6 @@ MODEL_NAMES = {
     "haiku": "Haiku",
 }
 
-# Progress bar config
 BAR_WIDTH = 20
 FILL_CHAR = "█"
 EMPTY_CHAR = "░"
@@ -52,12 +51,15 @@ def load_config():
         try:
             with open(CONFIG_PATH) as f:
                 user_cfg = json.load(f)
-            # Merge with defaults
             cfg = DEFAULT_CONFIG.copy()
+            cfg["limits"] = DEFAULT_CONFIG["limits"].copy()
             if "limits" in user_cfg:
                 for window in ("5h", "7d"):
                     if window in user_cfg["limits"]:
-                        cfg["limits"][window].update(user_cfg["limits"][window])
+                        cfg["limits"][window] = {
+                            **DEFAULT_CONFIG["limits"].get(window, {}),
+                            **user_cfg["limits"][window],
+                        }
             return cfg
         except (json.JSONDecodeError, KeyError):
             pass
@@ -97,12 +99,12 @@ def progress_bar(current, limit, width=BAR_WIDTH):
 
 def bar_color(pct):
     if pct >= 90:
-        return "#EF4444"  # red
+        return "#EF4444"
     if pct >= 70:
-        return "#F59E0B"  # amber
+        return "#F59E0B"
     if pct >= 50:
-        return "#FBBF24"  # yellow
-    return "#10B981"  # green
+        return "#FBBF24"
+    return "#10B981"
 
 
 def parse_logs():
@@ -194,38 +196,8 @@ def model_output(usage_dict, model):
     return usage_dict.get(model, {}).get("output", 0)
 
 
-def render_window(label, usage_dict, limits, msg_count, color):
-    total_out = total_output(usage_dict)
-    total_limit = limits.get("total", 1)
-    bar, pct = progress_bar(total_out, total_limit)
-    bc = bar_color(pct)
-
-    print(f"{label} — {pct:.0f}% | size=14 color={color}")
-    print(f"--{bar} {pct:.0f}% ({fmt_tokens(total_out)}/{fmt_tokens(total_limit)}) | font=Menlo size=12 color={bc}")
-    print(f"--Messages: {msg_count} | font=Menlo size=12")
-    print("-----")
-
-    # Per-model bars
-    for model_key in ("opus", "sonnet", "haiku"):
-        out = model_output(usage_dict, model_key)
-        model_limit = limits.get(model_key, 0)
-        if model_limit <= 0 and out == 0:
-            continue
-        m_bar, m_pct = progress_bar(out, model_limit)
-        mc = bar_color(m_pct)
-        name = friendly_model(model_key)
-        print(f"--{name} | size=12")
-        print(f"----{m_bar} {m_pct:.0f}% | font=Menlo size=11 color={mc}")
-        print(f"----{fmt_tokens(out)} / {fmt_tokens(model_limit)} output | font=Menlo size=11")
-
-    # Other models (if any)
-    for model_key in sorted(usage_dict.keys()):
-        if model_key in ("opus", "sonnet", "haiku"):
-            continue
-        out = usage_dict[model_key]["output"]
-        if out > 0:
-            name = friendly_model(model_key)
-            print(f"--{name}: {fmt_tokens(out)} output | font=Menlo size=11")
+def total_input(usage_dict):
+    return sum(v["input"] for v in usage_dict.values())
 
 
 def render():
@@ -234,59 +206,98 @@ def render():
     limits_5h = config["limits"]["5h"]
     limits_7d = config["limits"]["7d"]
 
-    # Menu bar title — show highest percentage between 5h and 7d
+    # Calculate percentages
     total_out_5h = total_output(data["5h"])
     total_out_7d = total_output(data["7d"])
-    pct_5h = (total_out_5h / limits_5h["total"] * 100) if limits_5h["total"] > 0 else 0
-    pct_7d = (total_out_7d / limits_7d["total"] * 100) if limits_7d["total"] > 0 else 0
+    sonnet_out_7d = model_output(data["7d"], "sonnet")
 
-    # Also check per-model percentages (Opus often hits limit first)
-    max_pct = max(pct_5h, pct_7d)
-    title_window = "5h" if pct_5h >= pct_7d else "7d"
-    for model_key in ("opus", "sonnet", "haiku"):
-        for window, limits, usage in [("5h", limits_5h, data["5h"]), ("7d", limits_7d, data["7d"])]:
-            model_limit = limits.get(model_key, 0)
-            if model_limit > 0:
-                model_pct = model_output(usage, model_key) / model_limit * 100
-                if model_pct > max_pct:
-                    max_pct = model_pct
-                    title_window = f"{window} {friendly_model(model_key)}"
+    limit_5h = limits_5h.get("total", 1)
+    limit_7d_all = limits_7d.get("all_models", 1)
+    limit_7d_sonnet = limits_7d.get("sonnet", 1)
+
+    pct_5h = min(total_out_5h / limit_5h * 100, 100) if limit_5h > 0 else 0
+    pct_7d_all = min(total_out_7d / limit_7d_all * 100, 100) if limit_7d_all > 0 else 0
+    pct_7d_sonnet = min(sonnet_out_7d / limit_7d_sonnet * 100, 100) if limit_7d_sonnet > 0 else 0
+
+    # Menu bar title — show highest percentage (most constrained)
+    max_pct = max(pct_5h, pct_7d_all, pct_7d_sonnet)
+    tc = bar_color(max_pct)
 
     if total_out_5h == 0 and total_out_7d == 0:
-        title = "C: idle"
+        print("C: idle | sfimage=brain.head.profile")
     else:
-        # Compact bar in menu bar title (8 chars wide)
         mini_bar, _ = progress_bar(max_pct, 100, width=8)
-        title = f"C: {mini_bar} {max_pct:.0f}%"
-
-    # Color the title based on severity
-    tc = bar_color(max_pct)
-    print(f"{title} | sfimage=brain.head.profile color={tc}")
-    print("---")
-
-    # 5-hour window
-    render_window("5-Hour Window", data["5h"], limits_5h, data["messages_5h"], "#7C3AED")
+        print(f"C: {mini_bar} {max_pct:.0f}% | sfimage=brain.head.profile color={tc}")
 
     print("---")
 
-    # 7-day window
-    render_window("7-Day Window", data["7d"], limits_7d, data["messages_7d"], "#2563EB")
+    # === Current Session (5-hour window) ===
+    bar_5h, _ = progress_bar(total_out_5h, limit_5h)
+    bc_5h = bar_color(pct_5h)
+    print(f"Current Session — {pct_5h:.0f}% | size=14 color=#7C3AED")
+    print(f"--{bar_5h} {pct_5h:.0f}% | font=Menlo size=12 color={bc_5h}")
+    print(f"--{fmt_tokens(total_out_5h)} / {fmt_tokens(limit_5h)} output tokens | font=Menlo size=12")
+    print(f"--Messages: {data['messages_5h']} | font=Menlo size=12")
+    print("-----")
+    # Per-model breakdown (info only, not separate limits)
+    print("--By Model | size=12")
+    for model_key in ("opus", "sonnet", "haiku"):
+        out = model_output(data["5h"], model_key)
+        inp = data["5h"].get(model_key, {}).get("input", 0)
+        if out > 0 or inp > 0:
+            name = friendly_model(model_key)
+            share = (out / total_out_5h * 100) if total_out_5h > 0 else 0
+            print(f"----{name}: {fmt_tokens(out)} out, {fmt_tokens(inp)} in ({share:.0f}%) | font=Menlo size=11")
+
+    print("---")
+
+    # === Weekly Limits ===
+    print(f"Weekly Limits | size=14 color=#2563EB")
+
+    # All models
+    bar_7d, _ = progress_bar(total_out_7d, limit_7d_all)
+    bc_7d = bar_color(pct_7d_all)
+    print(f"--All Models — {pct_7d_all:.0f}% | size=13")
+    print(f"----{bar_7d} {pct_7d_all:.0f}% | font=Menlo size=12 color={bc_7d}")
+    print(f"----{fmt_tokens(total_out_7d)} / {fmt_tokens(limit_7d_all)} output tokens | font=Menlo size=12")
+    print(f"----Messages: {data['messages_7d']} | font=Menlo size=12")
+
+    # Sonnet only
+    bar_sonnet, _ = progress_bar(sonnet_out_7d, limit_7d_sonnet)
+    bc_sonnet = bar_color(pct_7d_sonnet)
+    print(f"--Sonnet Only — {pct_7d_sonnet:.0f}% | size=13")
+    print(f"----{bar_sonnet} {pct_7d_sonnet:.0f}% | font=Menlo size=12 color={bc_sonnet}")
+    print(f"----{fmt_tokens(sonnet_out_7d)} / {fmt_tokens(limit_7d_sonnet)} output tokens | font=Menlo size=12")
+
+    print("-----")
+    # Per-model breakdown (info only)
+    print("--By Model | size=12")
+    for model_key in ("opus", "sonnet", "haiku"):
+        out = model_output(data["7d"], model_key)
+        inp = data["7d"].get(model_key, {}).get("input", 0)
+        if out > 0 or inp > 0:
+            name = friendly_model(model_key)
+            share = (out / total_out_7d * 100) if total_out_7d > 0 else 0
+            print(f"----{name}: {fmt_tokens(out)} out, {fmt_tokens(inp)} in ({share:.0f}%) | font=Menlo size=11")
 
     print("---")
 
     # Cache summary
     cache_r_5h = sum(v["cache_read"] for v in data["5h"].values())
     cache_c_5h = sum(v["cache_create"] for v in data["5h"].values())
-    cache_r_7d = sum(v["cache_read"] for v in data["7d"].values())
-    cache_c_7d = sum(v["cache_create"] for v in data["7d"].values())
     print(f"Cache (5h): {fmt_tokens(cache_r_5h)} read, {fmt_tokens(cache_c_5h)} write | size=11 color=gray")
-    print(f"Cache (7d): {fmt_tokens(cache_r_7d)} read, {fmt_tokens(cache_c_7d)} write | size=11 color=gray")
 
     print("---")
 
-    # Config hint
-    print(f"Limits: {CONFIG_PATH} | size=10 color=gray")
-    print(f"--Edit config to adjust limits | size=11 bash=open param1={CONFIG_PATH} terminal=false")
+    # Caveat
+    print("Claude Code only — web usage not tracked | size=10 color=#F59E0B")
+
+    print("---")
+
+    # Config
+    print(f"Settings | size=12")
+    print(f"--Config: {CONFIG_PATH} | size=10 color=gray")
+    print(f"--Edit config | size=11 bash=open param1={CONFIG_PATH} terminal=false")
     if not os.path.exists(CONFIG_PATH):
         print(f"--Create default config | size=11 bash=python3 param1=-c param2=import\\ json;open('{CONFIG_PATH}','w').write(json.dumps({json.dumps(DEFAULT_CONFIG)},indent=2)) terminal=false refresh=true")
 
