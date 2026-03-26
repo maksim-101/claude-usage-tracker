@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Claude Code Usage Tracker — SwiftBar plugin
-Parses local JSONL logs from ~/.claude/projects/ to display token usage,
-cache efficiency, project activity, and git status.
+Claude Code + GSD Usage Tracker — SwiftBar plugin
+Parses local JSONL logs from ~/.claude/projects/ and ~/.gsd/projects/ to
+display token usage, cache efficiency, project activity, and git status.
 100% offline — no network calls, no data leaves your machine.
 
-NOTE: Only tracks Claude Code usage. Web (claude.ai) usage is not captured
-but counts toward the same limits.
+NOTE: Only tracks Claude Code and GSD (gsd-pi) usage. Web (claude.ai) usage
+is not captured but counts toward the same limits.
 """
 
 import json
@@ -100,6 +100,45 @@ def extract_project_name(filepath):
 def day_label(dt):
     """Short weekday label for a date."""
     return dt.strftime("%a")
+
+
+GSD_SESSIONS_DIR = os.path.expanduser("~/.gsd/sessions")
+
+
+def extract_gsd_session_project_name(filepath):
+    """Extract a friendly project name from a GSD session JSONL path.
+
+    Session dirs are named like --Users-mowehr-Documents-claude_projects-vaca-dia--
+    Strip the leading/trailing -- and extract the last path component.
+    """
+    rel = os.path.relpath(filepath, GSD_SESSIONS_DIR)
+    session_dir = rel.split(os.sep)[0]
+
+    # Strip leading/trailing --
+    cleaned = session_dir.strip("-")
+
+    # Try to get just the repo folder name from the encoded path
+    # e.g. "Users-mowehr-Documents-claude_projects-vaca-dia" -> "vaca-dia"
+    if cleaned:
+        # The path uses - as separator; take the last segment
+        # Handle known prefixes to get the project name
+        for prefix in [
+            "Users-mowehr-Documents-claude_projects-",
+            "Users-mowehr-Documents-claude-projects-",
+            "Users-mowehr-",
+        ]:
+            if cleaned.startswith(prefix):
+                name = cleaned[len(prefix):] or cleaned
+                return f"{DISPLAY_NAMES.get(name, name)} (gsd)"
+
+        # If .claude path
+        if cleaned == "Users-mowehr-.claude-" or cleaned == "Users-mowehr-.claude":
+            return ".claude (gsd)"
+
+        name = cleaned.split("-")[-1] if "-" in cleaned else cleaned
+        return f"{name} (gsd)"
+
+    return f"{session_dir} (gsd)"
 
 
 # ── Log Parsing ──────────────────────────────────────────────────────────────
@@ -216,6 +255,93 @@ def parse_logs():
                         w["messages"] += 1
 
                     # Today bucket
+                    if ts_local >= today_start:
+                        d = today_data
+                        d["by_model"][model]["input"] += input_tokens
+                        d["by_model"][model]["output"] += output_tokens
+                        d["by_project"][project]["input"] += input_tokens
+                        d["by_project"][project]["output"] += output_tokens
+                        d["cache"]["read"] += cache_read
+                        d["cache"]["create"] += cache_create
+                        d["cache"]["fresh_input"] += fresh_input
+                        d["messages"] += 1
+
+        except (OSError, PermissionError):
+            continue
+
+    # ── GSD (gsd-pi) session logs ──
+    # Uses different field names: input/output/cacheRead/cacheWrite
+    gsd_session_files = glob.glob(
+        os.path.join(GSD_SESSIONS_DIR, "**", "*.jsonl"), recursive=True
+    )
+
+    for filepath in gsd_session_files:
+        try:
+            mtime = os.path.getmtime(filepath)
+            if datetime.fromtimestamp(mtime, tz=timezone.utc) < cutoff.astimezone(timezone.utc):
+                continue
+        except OSError:
+            continue
+
+        project = extract_gsd_session_project_name(filepath)
+
+        try:
+            with open(filepath, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg = entry.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+                    if msg.get("role") != "assistant":
+                        continue
+
+                    ts_str = entry.get("timestamp")
+                    if not ts_str:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        continue
+
+                    ts_local = ts.astimezone(local_now.tzinfo)
+                    if ts_local < cutoff:
+                        continue
+
+                    if project not in project_last_active or ts_local > project_last_active[project]:
+                        project_last_active[project] = ts_local
+
+                    model = classify_model(msg.get("model", ""))
+                    # GSD uses shorthand keys (no _tokens suffix)
+                    input_tokens = usage.get("input", 0)
+                    output_tokens = usage.get("output", 0)
+                    cache_read = usage.get("cacheRead", 0)
+                    cache_create = usage.get("cacheWrite", 0)
+                    fresh_input = input_tokens
+
+                    day_key = ts_local.strftime("%Y-%m-%d")
+                    daily_output[day_key] += output_tokens
+
+                    if ts_local >= week_start:
+                        w = week_data
+                        w["by_model"][model]["input"] += input_tokens
+                        w["by_model"][model]["output"] += output_tokens
+                        w["by_project"][project]["input"] += input_tokens
+                        w["by_project"][project]["output"] += output_tokens
+                        w["cache"]["read"] += cache_read
+                        w["cache"]["create"] += cache_create
+                        w["cache"]["fresh_input"] += fresh_input
+                        w["messages"] += 1
+
                     if ts_local >= today_start:
                         d = today_data
                         d["by_model"][model]["input"] += input_tokens
@@ -481,7 +607,7 @@ def render():
     print("---")
 
     # ── Footer ──
-    print("Claude Code only — web usage not tracked | size=10 color=#F59E0B")
+    print("Claude Code + GSD — web usage not tracked | size=10 color=#F59E0B")
     print("---")
     print("Refresh | refresh=true")
     now_str = datetime.now().strftime("%H:%M")

@@ -1,6 +1,6 @@
 # Claude Usage Tracker
 
-A lightweight macOS menu bar plugin that tracks your Claude Code token usage against rate limit windows. Built with [SwiftBar](https://github.com/swiftbar/SwiftBar).
+A lightweight macOS menu bar plugin that tracks your Claude Code and [GSD](https://gsd.quest) (gsd-pi) token usage. Built with [SwiftBar](https://github.com/swiftbar/SwiftBar).
 
 **100% offline** — parses local log files only. No data leaves your machine.
 
@@ -8,18 +8,27 @@ A lightweight macOS menu bar plugin that tracks your Claude Code token usage aga
 
 ## What It Shows
 
-- **Current Session (5h)** — progress bar with output token count and percentage
-- **Weekly Limits** — "All Models" and "Sonnet Only" bars, matching claude.ai's layout
-- **Per-model breakdown** — Opus, Sonnet, Haiku with share percentages
-- **Color-coded bars** — green → yellow → amber → red as usage increases
+- **Today / This Week** — output and input token totals with message counts
+- **By Model** — breakdown across Opus, Sonnet, and Haiku
+- **By Project** — per-project token usage (Claude Code projects + GSD projects)
+- **Daily Output Sparkline** — visual chart of output tokens per day for the current week
+- **Cache Efficiency** — hit ratio with color-coded indicators (green/yellow/orange/red)
+- **Project Activity** — last-active timestamps and weekly output per project
+- **Git Status** — dirty files and unpushed commits across all repos
+- **Open PRs** — open pull requests via `gh` CLI
 
-The menu bar title shows the highest usage percentage across all windows so you can see at a glance how close you are to any limit.
+The menu bar title shows today's output token count at a glance.
 
-## How It Works
+## Data Sources
 
-Claude Code stores conversation logs as JSONL files in `~/.claude/projects/`. This plugin parses those files, sums token usage within the 5-hour and 7-day windows, and displays the results via SwiftBar. No API calls, no network requests.
+| Source | Log Location | Description |
+|--------|-------------|-------------|
+| Claude Code | `~/.claude/projects/**/*.jsonl` | Direct Claude Code sessions and subagent logs |
+| GSD (gsd-pi) | `~/.gsd/sessions/**/*.jsonl` | GSD autonomous agent session logs |
 
-**Note:** Only Claude Code usage is tracked. Usage from claude.ai web, desktop app, or iOS app counts toward the same limits but won't appear here.
+GSD projects are labeled with a `(gsd)` suffix in the project breakdown.
+
+**Note:** Web usage from claude.ai, the desktop app, or the iOS app counts toward the same rate limits but is not captured here.
 
 ## Requirements
 
@@ -27,6 +36,7 @@ Claude Code stores conversation logs as JSONL files in `~/.claude/projects/`. Th
 - [SwiftBar](https://github.com/swiftbar/SwiftBar) — `brew install --cask swiftbar`
 - Python 3 (included with macOS)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (the logs it generates are what we read)
+- Optional: [GSD](https://gsd.quest) (gsd-pi) for autonomous agent tracking
 
 ## Installation
 
@@ -48,26 +58,6 @@ Claude Code stores conversation logs as JSONL files in `~/.claude/projects/`. Th
 
 4. Launch SwiftBar and point it to `~/Library/Application Support/SwiftBar/Plugins/` if prompted.
 
-## Configuration
-
-Limits are configurable via `~/.claude/usage-tracker-config.json`. Create it from the SwiftBar menu (Settings → Create default config) or manually:
-
-```json
-{
-  "limits": {
-    "5h": {
-      "total": 2000000
-    },
-    "7d": {
-      "all_models": 13000000,
-      "sonnet": 7000000
-    }
-  }
-}
-```
-
-Values are in **output tokens**. The defaults are calibrated for the Max 5x plan ($100/mo). Adjust based on your subscription tier and what you observe in claude.ai's usage page.
-
 ## Updating
 
 After pulling changes or editing the plugin:
@@ -80,10 +70,9 @@ Then click **Refresh** in the SwiftBar menu.
 
 ## Privacy
 
-- Reads only from `~/.claude/projects/*.jsonl` (local Claude Code logs)
-- No network calls whatsoever
+- Reads only from local log files (`~/.claude/projects/`, `~/.gsd/sessions/`)
+- No network calls whatsoever (except `gh pr list` for open PRs, which is optional)
 - No telemetry, analytics, or external services
-- Config stored locally at `~/.claude/usage-tracker-config.json`
 
 ## License
 
