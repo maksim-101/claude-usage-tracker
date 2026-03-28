@@ -18,6 +18,7 @@ from collections import defaultdict
 
 CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
 PROJECTS_DIR = os.path.expanduser("~/Documents/claude_projects")
+RATE_LIMITS_FILE = os.path.expanduser("~/.claude/.rate_limits")
 
 # SwiftBar runs with a minimal PATH — ensure common tool locations are included
 for p in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]:
@@ -38,8 +39,44 @@ DISPLAY_NAMES = {
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
+# Rate limit staleness threshold (minutes) — ignore data older than this
+RATE_LIMIT_STALE_MINUTES = 30
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def read_rate_limits():
+    """Read rate limit data written by statusline.sh.
+
+    Returns dict with five_hour_pct and resets_at, or None if stale/missing.
+    """
+    try:
+        with open(RATE_LIMITS_FILE, "r") as f:
+            data = json.loads(f.read().strip())
+        ts = data.get("ts", 0)
+        age_minutes = (datetime.now().timestamp() - ts) / 60
+        if age_minutes > RATE_LIMIT_STALE_MINUTES:
+            return None
+        return data
+    except (OSError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def progress_bar(pct, width=10):
+    """Return a colored progress bar string for SwiftBar."""
+    filled = int(pct * width / 100)
+    empty = width - filled
+    return "█" * filled + "░" * empty
+
+
+def bar_color(pct):
+    """Color for rate limit bar — green/yellow/red."""
+    if pct >= 90:
+        return "#EF4444"   # red
+    if pct >= 70:
+        return "#FBBF24"   # yellow
+    return "#10B981"       # green
 
 
 def classify_model(model_id):
@@ -511,13 +548,47 @@ def render():
     out_today = total_output(data["today"]["by_model"])
     out_week = total_output(data["week"]["by_model"])
 
+    # ── Rate Limits ──
+    rate = read_rate_limits()
+
     # ── Menu Bar ──
     if out_today == 0 and out_week == 0:
-        print("C: idle | sfimage=brain.head.profile")
+        title = "C: idle"
     else:
-        print(f"C: {fmt_tokens(out_today)} | sfimage=brain.head.profile")
+        title = f"C: {fmt_tokens(out_today)}"
+
+    # Append compact rate limit to menu bar title if available
+    if rate:
+        pct = rate["five_hour_pct"]
+        title += f"  5h:{pct}%"
+
+    print(f"{title} | sfimage=brain.head.profile")
 
     print("---")
+
+    # ── 5-Hour Usage Limit ──
+    if rate:
+        pct = rate["five_hour_pct"]
+        color = bar_color(pct)
+        bar = progress_bar(pct)
+        label = "5-Hour Usage Limit"
+        if pct >= 90:
+            label += " — SLOW DOWN"
+        print(f"{label} | size=14 color={color}")
+        print(f"--{bar}  {pct}% | font=Menlo size=13 color={color}")
+        resets_at = rate.get("resets_at", "")
+        if resets_at:
+            try:
+                # Try as Unix timestamp first, then ISO 8601
+                try:
+                    reset_dt = datetime.fromtimestamp(int(resets_at), tz=timezone.utc)
+                except (ValueError, TypeError):
+                    reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+                reset_local = reset_dt.astimezone(datetime.now().astimezone().tzinfo)
+                print(f"--Resets at {reset_local.strftime('%H:%M')} | font=Menlo size=11 color=gray")
+            except (ValueError, AttributeError, OSError):
+                pass
+        print("---")
 
     # ── Today ──
     render_section("Today", "#7C3AED", data["today"])
