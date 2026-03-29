@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
-PROJECTS_DIR = os.path.expanduser("~/Documents/claude_projects")
+PROJECTS_DIR = os.path.expanduser("~/code")
 RATE_LIMITS_FILE = os.path.expanduser("~/.claude/.rate_limits")
 
 # SwiftBar runs with a minimal PATH — ensure common tool locations are included
@@ -121,7 +121,7 @@ def extract_project_name(filepath):
         return ".claude"
 
     prefixes = [
-        "-Users-mowehr-Documents-claude_projects-",
+        "-Users-mowehr-code-",
         "-Users-mowehr-Documents-claude-projects-",
         "-Users-mowehr-",
     ]
@@ -145,7 +145,7 @@ GSD_SESSIONS_DIR = os.path.expanduser("~/.gsd/sessions")
 def extract_gsd_session_project_name(filepath):
     """Extract a friendly project name from a GSD session JSONL path.
 
-    Session dirs are named like --Users-mowehr-Documents-claude_projects-vaca-dia--
+    Session dirs are named like --Users-mowehr-code-vaca-dia--
     Strip the leading/trailing -- and extract the last path component.
     """
     rel = os.path.relpath(filepath, GSD_SESSIONS_DIR)
@@ -155,13 +155,13 @@ def extract_gsd_session_project_name(filepath):
     cleaned = session_dir.strip("-")
 
     # Try to get just the repo folder name from the encoded path
-    # e.g. "Users-mowehr-Documents-claude_projects-vaca-dia" -> "vaca-dia"
+    # e.g. "Users-mowehr-code-vaca-dia" -> "vaca-dia"
     if cleaned:
         # The path uses - as separator; take the last segment
         # Handle known prefixes to get the project name
         for prefix in [
-            "Users-mowehr-Documents-claude_projects-",
-            "Users-mowehr-Documents-claude-projects-",
+            "Users-mowehr-code-",
+            "Users-mowehr-Documents-claude-projects-",  # legacy path
             "Users-mowehr-",
         ]:
             if cleaned.startswith(prefix):
