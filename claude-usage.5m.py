@@ -19,6 +19,9 @@ from collections import defaultdict
 CLAUDE_DIR = os.path.expanduser("~/.claude/projects")
 PROJECTS_DIR = os.path.expanduser("~/code")
 RATE_LIMITS_FILE = os.path.expanduser("~/.claude/.rate_limits")
+SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
+GSD_DEFAULTS_FILE = os.path.expanduser("~/.gsd/defaults.json")
+GSD_VERSION_FILE = os.path.expanduser("~/.claude/get-shit-done/VERSION")
 
 # SwiftBar runs with a minimal PATH — ensure common tool locations are included
 for p in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]:
@@ -61,6 +64,79 @@ def read_rate_limits():
         return data
     except (OSError, json.JSONDecodeError, KeyError):
         return None
+
+
+def read_config():
+    """Read Claude Code and GSD configuration for display.
+
+    Returns dict with effort_level, context_window, cc_version, gsd_profile, gsd_version, model.
+    """
+    config = {
+        "effort_level": "unknown",
+        "context_window": "1M",
+        "cc_version": "unknown",
+        "gsd_profile": "unknown",
+        "gsd_version": "unknown",
+        "model": "unknown",
+    }
+
+    # Effort level: env var takes precedence, then settings.json
+    env_effort = os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "")
+    if env_effort:
+        config["effort_level"] = env_effort
+    else:
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                settings = json.loads(f.read())
+            config["effort_level"] = settings.get("effortLevel", "medium (default)")
+        except (OSError, json.JSONDecodeError):
+            config["effort_level"] = "medium (default)"
+
+    # Context window: check env var first, then settings.json env block
+    if os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT") == "1":
+        config["context_window"] = "200K"
+    else:
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                settings = json.loads(f.read())
+            if settings.get("env", {}).get("CLAUDE_CODE_DISABLE_1M_CONTEXT") == "1":
+                config["context_window"] = "200K"
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # CC version — read from symlink target (SwiftBar can't find claude in PATH)
+    claude_symlink = os.path.expanduser("~/.local/bin/claude")
+    try:
+        target = os.readlink(claude_symlink)
+        # Target is like ~/.local/share/claude/versions/2.1.104
+        config["cc_version"] = os.path.basename(target)
+    except OSError:
+        pass
+
+    # Model from settings
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            settings = json.loads(f.read())
+        config["model"] = settings.get("model", "default")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    # GSD profile
+    try:
+        with open(GSD_DEFAULTS_FILE, "r") as f:
+            gsd = json.loads(f.read())
+        config["gsd_profile"] = gsd.get("model_profile", "balanced")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    # GSD version
+    try:
+        with open(GSD_VERSION_FILE, "r") as f:
+            config["gsd_version"] = f.read().strip()
+    except OSError:
+        pass
+
+    return config
 
 
 def progress_bar(pct, width=10):
@@ -674,6 +750,22 @@ def render():
                     print(f"----{repo_name}: #{pr['number']} {pr.get('title', '')} | font=Menlo size=10")
         else:
             print(f"--No open PRs | font=Menlo size=11 color=gray")
+
+    print("---")
+
+    # ── Config ──
+    cfg = read_config()
+    print(f"Config | size=14 color=#6366F1")
+
+    effort_color = "#10B981" if cfg["effort_level"] == "high" else "#FBBF24"
+    print(f"--Effort: {cfg['effort_level']} | font=Menlo size=12 color={effort_color}")
+
+    ctx_color = "#10B981" if cfg["context_window"] == "200K" else "#FBBF24"
+    print(f"--Context: {cfg['context_window']} | font=Menlo size=12 color={ctx_color}")
+
+    print(f"--Model: {cfg['model']} | font=Menlo size=12")
+    print(f"--CC Version: {cfg['cc_version']} | font=Menlo size=12")
+    print(f"--GSD: v{cfg['gsd_version']} ({cfg['gsd_profile']}) | font=Menlo size=12")
 
     print("---")
 
